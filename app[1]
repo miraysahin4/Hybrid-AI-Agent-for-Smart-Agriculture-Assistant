@@ -1,0 +1,1302 @@
+from flask import Flask, request, jsonify, render_template_string
+import os
+import json
+import statistics
+import difflib
+import urllib.parse
+import urllib.request
+from anthropic import Anthropic
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+# =======================
+#  UYGULAMA AYARLARI
+# =======================
+APP_NAME = "Smart Agriculture Assistant"
+
+# Sabit sensör tipleri (f_ij matrisi için)
+SENSOR_TYPES = ["pH", "Moisture", "EC", "SoilTemp", "NDVI", "NPK"]
+
+# =======================
+#  LLM (GPT-4.1-mini)
+# =======================
+
+def llm_answer(message: str, lang: str, state: dict, sensors: dict):
+    system_msg = f"""
+You are a Smart Agriculture Decision Support AI.
+
+You MUST follow this workflow:
+
+STEP 1 — Analysis
+- Analyze the selected polygon and target points.
+- Consider climate, soil, vegetation and region.
+
+STEP 2 — Sensor Recommendation
+- Recommend the MOST USEFUL sensor types among:
+  {SENSOR_TYPES}
+- Explain WHY each sensor is needed.
+
+STEP 3 — Confirmation Question (IMPORTANT)
+- Ask the user clearly:
+  "Do you accept these sensor recommendations, or would you like to modify them?"
+
+STEP 4 — (Only if user accepts)
+- Prepare a coverage requirement structure:
+  - Targets are indexed as i = 1,2,3,...
+  - Sensors are indexed as j = 1,2,3,...
+  - f_ij = 1 if sensor j is required at target i, else 0
+- Present this as a matrix-like explanation (textual description is enough).
+
+Context:
+- Language: {lang}
+- Polygon: {state.get("polygon")}
+- Targets: {state.get("targets")}
+- User-provided sensor data (if any): {sensors}
+
+Rules:
+- Be technical but understandable.
+- Use bullet points.
+- Do NOT invent real measurements.
+- If data is missing, say so and ask.
+"""
+
+
+    print("🔥 [LLM] llm_answer fonksiyonuna girildi", flush=True)
+    print("🔥 [LLM] API KEY var mı?:", bool(ANTHROPIC_API_KEY), flush=True)
+    if ANTHROPIC_API_KEY:
+        print("🔥 [LLM] KEY başlangıcı:", ANTHROPIC_API_KEY[:7], flush=True)
+
+    if not ANTHROPIC_API_KEY or not ANTHROPIC_API_KEY.startswith("sk-ant-"):
+        print("❌ [LLM] ANTHROPIC_API_KEY yok veya geçersiz", flush=True)
+        return None
+
+    try:
+        print("🚀 [LLM] Claude API çağrısı yapılacak...", flush=True)
+        client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        # ... senin mevcut kod aynı kalsın ...
+
+        resp = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=900,
+            temperature=0.35,
+            system=system_msg,
+            messages=[{"role": "user", "content": message}],
+        )
+
+        if not resp.content or not resp.content[0].text.strip():
+          return None
+
+        text = resp.content[0].text.strip()
+        return text
+
+    except Exception as e:
+        print("⚠️ [LLM] Claude API hatası:", repr(e), flush=True)
+        return None
+
+
+
+# =======================
+#  Tiny agronomy helpers
+# =======================
+
+# ---------- In-memory state ----------
+STATE = {
+    "polygon": [],  # [[lat,lng], ...]
+    "targets": [],  # [{lat, lng, label}]
+    "location_label": "",
+    "last_geocode": None,
+    "sensor_matrix": None,  # {"matrix": [[..]], "types": [...], "target_labels": [...]}
+    "sensor_types": SENSOR_TYPES,
+}
+
+CROPS_TR = [
+    "armut",
+    "elma",
+    "zeytin",
+    "pamuk",
+    "mısır",
+    "buğday",
+    "arpa",
+    "ayçiçeği",
+    "soya",
+    "çeltik",
+    "üzüm",
+    "kiraz",
+    "şeftali",
+    "fındık",
+    "antepfıstığı",
+    "patates",
+    "domates",
+    "biber",
+]
+CROPS_EN = [
+    "pear",
+    "apple",
+    "olive",
+    "cotton",
+    "maize",
+    "corn",
+    "wheat",
+    "barley",
+    "sunflower",
+    "soy",
+    "soybean",
+    "paddy",
+    "rice",
+    "grape",
+    "cherry",
+    "peach",
+    "hazelnut",
+    "pistachio",
+    "potato",
+    "tomato",
+    "pepper",
+]
+
+
+def fuzzy_crop(q, lang):
+    q = (q or "").lower()
+    vocab = list(set(CROPS_TR + CROPS_EN))
+    best, score = None, 0
+    for tok in q.replace(",", " ").split():
+        cand = difflib.get_close_matches(tok, vocab, n=1, cutoff=0.78)
+        if cand:
+            s = difflib.SequenceMatcher(None, tok, cand[0]).ratio()
+            if s > score:
+                best, score = cand[0], s
+    return best
+
+
+def state_centroid(state=None):
+    st = state or STATE
+    if st["polygon"]:
+        lat = statistics.mean(p[0] for p in st["polygon"])
+        lng = statistics.mean(p[1] for p in st["polygon"])
+        return (lat, lng)
+    if st["targets"]:
+        lat = statistics.mean(t["lat"] for t in st["targets"])
+        lng = statistics.mean(t["lng"] for t in st["targets"])
+        return (lat, lng)
+    return None
+
+
+def fmt_coords(lat, lng):
+    return f"{lat:.5f}, {lng:.5f}"
+
+
+def soil_signals(ph, moist, temp, ndvi, lang):
+    out = []
+    if ph is not None:
+        if ph < 6:
+            out.append(
+                "pH düşük → kireçleme/kompost."
+                if lang == "tr"
+                else "Low pH → consider liming/compost."
+            )
+        elif ph > 7.5:
+            out.append(
+                "pH yüksek → elementel kükürt/organik madde."
+                if lang == "tr"
+                else "High pH → elemental sulfur/organic matter."
+            )
+        else:
+            out.append(
+                "pH 6.0–7.5 aralığında." if lang == "tr" else "pH in 6.0–7.5 range."
+            )
+    if moist is not None:
+        if moist < 30:
+            out.append(
+                "Nem <%30 → damla sulama + malç."
+                if lang == "tr"
+                else "Moisture <30% → drip + mulch."
+            )
+        elif moist > 70:
+            out.append(
+                "Nem yüksek → sulamayı azalt, drenaj."
+                if lang == "tr"
+                else "High moisture → reduce irrigation, improve drainage."
+            )
+    if temp is not None:
+        if temp < 5:
+            out.append(
+                "Düşük sıcaklık → don riski."
+                if lang == "tr"
+                else "Low temperature → frost risk."
+            )
+        elif temp > 35:
+            out.append(
+                "Yüksek sıcaklık → gölgeleme."
+                if lang == "tr"
+                else "High temperature → shading."
+            )
+    if ndvi is not None:
+        if ndvi < 0.3:
+            out.append(
+                "NDVI düşük → bitki örtüsü zayıf / stresli."
+                if lang == "tr"
+                else "Low NDVI → weak/stressed vegetation."
+            )
+        elif ndvi < 0.6:
+            out.append(
+                "NDVI orta → gelişim idare eder, izlenmeli."
+                if lang == "tr"
+                else "Medium NDVI → average vegetation, monitor."
+            )
+        else:
+            out.append(
+                "NDVI yüksek → bitki örtüsü güçlü."
+                if lang == "tr"
+                else "High NDVI → strong vegetation."
+            )
+    return out
+
+
+def craft_answer(msg, sensors, lang):
+    """
+    LLM çalışmazsa devreye giren lokal açıklama motoru.
+    """
+
+    def fget(k):
+        v = sensors.get(k)
+        try:
+            return float(v) if v not in (None, "") else None
+        except Exception:
+            return None
+
+    ph = fget("ph")
+    moist = fget("moisture")
+    temp = fget("temperature")
+    ndvi = fget("ndvi")
+
+    crop = fuzzy_crop(msg, lang)
+    c = state_centroid()
+    tgt_cnt = len(STATE["targets"])
+    has_poly = len(STATE["polygon"]) >= 3
+    loc = STATE["location_label"] or ("—" if lang == "tr" else "—")
+    sig = soil_signals(ph, moist, temp, ndvi, lang)
+
+    corners = STATE["polygon"][:5]  # ilk 5 köşe
+
+    ask_grow = ("yetişir mi" in (msg or "").lower()) or (
+        "grow" in (msg or "").lower()
+    )
+    ask_rec = (
+        ("ne önerirsin" in (msg or "").lower())
+        or ("recommend" in (msg or "").lower())
+        or ("best" in (msg or "").lower())
+    )
+
+    L = []
+
+    if lang == "tr":
+        L += [
+            "— Tarımsal Değerlendirme (Yerel Motor) —",
+            f"• Konum etiketi: {loc}",
+            f"• Bölge merkezi: {fmt_coords(*c) if c else '—'}",
+            f"• Bölge çokgeni: {'var' if has_poly else 'yok'}.",
+            f"• Hedef noktalar: {tgt_cnt} adet.",
+        ]
+        if corners:
+            L.append("• Bölge köşe noktaları (ilk 5):")
+            for i, (la, ln) in enumerate(corners, 1):
+                L.append(f"   {i}) {fmt_coords(la, ln)}")
+        if STATE["targets"]:
+            L.append("• Seçili hedefler:")
+            for i, t in enumerate(STATE["targets"], 1):
+                lab = t.get("label") or "(map)"
+                L.append(f"   {i}) {lab} → {fmt_coords(t['lat'], t['lng'])}")
+        if crop:
+            crop_tr = (
+                crop
+                if crop in CROPS_TR
+                else {
+                    "corn": "mısır",
+                    "maize": "mısır",
+                    "wheat": "buğday",
+                    "barley": "arpa",
+                    "sunflower": "ayçiçeği",
+                    "soybean": "soya",
+                    "rice": "çeltik",
+                    "paddy": "çeltik",
+                }.get(crop, crop)
+            )
+            L.append(f"• Odak ürün: {crop_tr.title()}.")
+
+        if sig:
+            L += ["", "— Toprak/Sulama / Bitki Sinyalleri —"]
+            L += [f"• {s}" for s in sig]
+
+        L += ["", "— Eylem Planı —"]
+        if ask_grow and crop:
+            L += [
+                "1) pH 6–7 ve iyi drenaj doğrulansın.",
+                "2) Sezon başında %2–3 organik madde (kompost) + malç uygulaması.",
+                "3) 2–3 hedef noktada nem sensörü ile günlük kayıt.",
+                "4) NDVI düşük ise sulama / gübreleme stratejisini gözden geçir.",
+            ]
+        elif ask_rec:
+            L += [
+                "1) pH/EC/organik madde analizi ile ürün adaylarını netleştir (örnek: buğday, ayçiçeği, mısır).",
+                "2) Mikro-topografyaya göre tarlayı alt bölgelere ayır ve sulama hat tasarımını buna göre yap.",
+                "3) Haftalık sulama planı; nemi %40–60 aralığında tutmaya çalış.",
+                "4) NDVI takibi ile verimi düşük kalan alt bölgeleri tespit et.",
+            ]
+        else:
+            L += [
+                "1) 0–30 cm toprak örneği: pH, EC, organik madde analizi.",
+                "2) Haftalık sulama planı; nemi %40–60 aralığında tut.",
+                "3) Yüzey akışı ve drenajı (taban suyu) kontrol et.",
+                "4) Aylık sensör değerlendirmesi ve NDVI karşılaştırması ile planı güncelle.",
+            ]
+
+        if not (ph and moist and temp):
+            L += [
+                "",
+                "Eksik veri algılandı → Daha hassas öneriler için lütfen şunları gir:",
+                "• pH (örn: 6.5), Nem % (örn: 40), Sıcaklık °C (örn: 22), NDVI (örn: 0.55).",
+            ]
+
+        return "\n".join(L)
+
+    # ---- English branch ----
+    L += [
+        "— Agronomic Assessment (Local Fallback) —",
+        f"• Location label: {loc}",
+        f"• Region centroid: {fmt_coords(*c) if c else '—'}",
+        f"• Region polygon: {'set' if has_poly else 'not set'}.",
+        f"• Target points: {tgt_cnt}.",
+    ]
+    if corners:
+        L.append("• Region corner points (first 5):")
+        for i, (la, ln) in enumerate(corners, 1):
+            L.append(f"   {i}) {fmt_coords(la, ln)}")
+    if STATE["targets"]:
+        L.append("• Selected targets:")
+        for i, t in enumerate(STATE["targets"], 1):
+            lab = t.get("label") or "(map)"
+            L.append(f"   {i}) {lab} → {fmt_coords(t['lat'], t['lng'])}")
+    if crop:
+        L.append(f"• Focus crop: {crop.title()}.")
+
+    if sig:
+        L += ["", "— Soil / Irrigation / Vegetation Signals —"]
+        L += [f"• {s}" for s in sig]
+
+    L += ["", "— Action Plan —"]
+    if ask_grow and crop:
+        L += [
+            f"1) Verify pH 6–7 and good drainage for {crop.title()}.",
+            "2) Apply 2–3% organic matter + mulch at season start.",
+            "3) Daily moisture logging at 2–3 target points.",
+            "4) If NDVI is low, revisit irrigation and fertiliser strategy.",
+        ]
+    elif ask_rec:
+        L += [
+            "1) Use pH/EC/OM to shortlist candidate crops (e.g., wheat, sunflower, maize).",
+            "2) Subdivide the field by micro-topography and design irrigation laterals accordingly.",
+            "3) Weekly irrigation plan; keep soil moisture around 40–60%.",
+            "4) Track NDVI by sub-region to detect underperforming zones.",
+        ]
+    else:
+        L += [
+            "1) Take 0–30 cm soil samples for pH, EC and organic matter.",
+            "2) Set a weekly irrigation plan; keep moisture in the 40–60% band.",
+            "3) Check drainage (surface runoff and groundwater conditions).",
+            "4) Review sensors and NDVI monthly and adjust the plan.",
+        ]
+
+    if not (ph and moist and temp):
+        L += [
+            "",
+            "Missing data detected → For more precise advice, please provide:",
+            "• pH (e.g., 6.5), Moisture % (e.g., 40), Temperature °C (e.g., 22), NDVI (e.g., 0.55).",
+        ]
+    return "\n".join(L)
+
+
+# =======================
+#  OpenStreetMap / Nominatim
+# =======================
+NOMINATIM = "https://nominatim.openstreetmap.org"
+UA = "SmartAgriAssistant/3.0 (edu-demo)"
+
+
+def nominatim_get(path, params):
+    params = {**params, "format": "json"}
+    url = f"{NOMINATIM}{path}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+# ---------- Static countries list (A–Z) ----------
+COUNTRIES = sorted(
+    [
+        "Afghanistan",
+        "Albania",
+        "Algeria",
+        "Andorra",
+        "Angola",
+        "Argentina",
+        "Armenia",
+        "Australia",
+        "Austria",
+        "Azerbaijan",
+        "Bahamas",
+        "Bahrain",
+        "Bangladesh",
+        "Belarus",
+        "Belgium",
+        "Belize",
+        "Benin",
+        "Bhutan",
+        "Bolivia",
+        "Bosnia and Herzegovina",
+        "Botswana",
+        "Brazil",
+        "Brunei",
+        "Bulgaria",
+        "Burkina Faso",
+        "Burundi",
+        "Cambodia",
+        "Cameroon",
+        "Canada",
+        "Chile",
+        "China",
+        "Colombia",
+        "Costa Rica",
+        "Croatia",
+        "Cuba",
+        "Cyprus",
+        "Czech Republic",
+        "Denmark",
+        "Dominican Republic",
+        "Ecuador",
+        "Egypt",
+        "El Salvador",
+        "Estonia",
+        "Ethiopia",
+        "Finland",
+        "France",
+        "Georgia",
+        "Germany",
+        "Ghana",
+        "Greece",
+        "Greenland",
+        "Guatemala",
+        "Honduras",
+        "Hungary",
+        "Iceland",
+        "India",
+        "Indonesia",
+        "Iran",
+        "Iraq",
+        "Ireland",
+        "Israel",
+        "Italy",
+        "Jamaica",
+        "Japan",
+        "Jordan",
+        "Kazakhstan",
+        "Kenya",
+        "Kuwait",
+        "Kyrgyzstan",
+        "Laos",
+        "Latvia",
+        "Lebanon",
+        "Libya",
+        "Liechtenstein",
+        "Lithuania",
+        "Luxembourg",
+        "Madagascar",
+        "Malaysia",
+        "Maldives",
+        "Mali",
+        "Malta",
+        "Mexico",
+        "Moldova",
+        "Monaco",
+        "Mongolia",
+        "Montenegro",
+        "Morocco",
+        "Mozambique",
+        "Namibia",
+        "Nepal",
+        "Netherlands",
+        "New Zealand",
+        "Nicaragua",
+        "Nigeria",
+        "North Macedonia",
+        "Norway",
+        "Oman",
+        "Pakistan",
+        "Palestine",
+        "Panama",
+        "Paraguay",
+        "Peru",
+        "Philippines",
+        "Poland",
+        "Portugal",
+        "Qatar",
+        "Romania",
+        "Russia",
+        "Rwanda",
+        "Saudi Arabia",
+        "Senegal",
+        "Serbia",
+        "Singapore",
+        "Slovakia",
+        "Slovenia",
+        "Somalia",
+        "South Africa",
+        "South Korea",
+        "Spain",
+        "Sri Lanka",
+        "Sudan",
+        "Sweden",
+        "Switzerland",
+        "Syria",
+        "Taiwan",
+        "Tajikistan",
+        "Tanzania",
+        "Thailand",
+        "Tunisia",
+        "Turkey",
+        "Turkmenistan",
+        "Ukraine",
+        "United Arab Emirates",
+        "United Kingdom",
+        "United States",
+        "Uruguay",
+        "Uzbekistan",
+        "Venezuela",
+        "Vietnam",
+        "Yemen",
+        "Zambia",
+        "Zimbabwe",
+    ]
+)
+
+
+# =======================
+#  HTML (UI) – SENİN GÖRÜNÜMÜ KORUDUM 💚
+# =======================
+app = Flask(__name__)
+
+HTML = r"""{% raw %}
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Smart Agriculture Assistant</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"/>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+
+<style>
+:root{
+  --bg:#171411; --panel:#1f1b16; --sunken:#221e19; --line:#3b332c; --txt:#f3f0ea;
+  --brand:#7cc98a; --brand2:#5aa974; --danger:#d06b6b; --muted:#c9c2b9;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font-family:Inter,ui-sans-serif,-apple-system,Segoe UI,Roboto,Arial}
+
+header{position:sticky;top:0;z-index:900;display:flex;align-items:center;gap:12px;
+  padding:10px 14px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#1c1814,#171411)}
+.brand{display:flex;align-items:center;gap:10px}
+.brand .logo{font-size:20px}
+.brand .title{color:var(--brand);font-weight:800;font-size:20px}
+.badge{font-size:12px;background:#203324;border:1px solid #2d4736;color:#9fe2b0;border-radius:999px;padding:2px 8px}
+.lang{margin-left:auto;display:flex;gap:6px}
+.lang button{border:1px solid var(--line);background:#2a251f;color:#fff;border-radius:10px;padding:6px 10px;cursor:pointer}
+.lang button.active{background:var(--brand);color:#111}
+
+.container{padding:12px}
+
+/* Map area */
+.mapwrap{position:relative;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:#000}
+#map{height:56vh;width:100%}
+.stack{position:absolute;left:12px;top:12px;display:flex;flex-direction:column;gap:8px;z-index:650}
+.btn{border:none;border-radius:10px;padding:8px 12px;font-weight:800;cursor:pointer;transition:background 0.15s, box-shadow 0.15s, transform 0.08s}
+.btn:hover{transform:translateY(-1px)}
+.btn.mode-active{box-shadow:0 0 0 2px var(--brand2) inset;filter:brightness(1.08);}
+/* 🌌 HOLOGRAM-GLOW MODE EFFECT */
+.btn.mode-active {
+  box-shadow: 0 0 6px #8df3c9, 0 0 14px rgba(96, 255, 186, 0.65);
+  border: 1px solid #92ffd8;
+  background: linear-gradient(120deg, #173224, #1d3b2e, #22483a);
+  color: #b8ffe6 !important;
+  animation: holoPulse 1.2s infinite ease-in-out;
+}
+
+@keyframes holoPulse {
+  0% { filter: brightness(1) saturate(1.2); }
+  50% { filter: brightness(1.35) saturate(1.5); }
+  100% { filter: brightness(1) saturate(1.2); }
+}
+
+/* Buton hover (genel) */
+.btn:hover {
+  filter: brightness(1.1) saturate(1.2);
+  transform: translateY(-1px) scale(1.01);
+}
+
+.green{background:var(--brand);color:#112}
+.dark{background:#2b251f;color:#eee;border:1px solid var(--line)}
+.red{background:var(--danger);color:#fff}
+.hud{position:absolute;right:12px;bottom:10px;background:#111a14cc;border:1px solid #234;color:#e8fff2;
+  padding:6px 10px;border-radius:10px;font-size:12px;z-index:650}
+/* zoom control bottom-left */
+.leaflet-control-zoom{bottom:12px !important; left:12px !important; top:auto !important; right:auto !important;}
+.leaflet-left .leaflet-control{margin-left:12px}
+.leaflet-bottom .leaflet-control{margin-bottom:12px}
+
+/* Query section */
+.section{margin-top:14px;border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:14px}
+.section h3{margin:0 0 10px 0;color:var(--brand)}
+.grid{display:grid;grid-template-columns:repeat(5,1fr) 240px;gap:10px}
+@media (max-width:1200px){.grid{grid-template-columns:1fr 1fr 1fr}}
+@media (max-width:700px){.grid{grid-template-columns:1fr}}
+label{display:block;margin:6px 0 4px 2px;color:var(--muted);font-weight:700}
+input[type=text]{width:100%;padding:10px;border:none;border-radius:12px;background:var(--sunken);color:var(--txt)}
+.auto-wrap{position:relative}
+.auto-wrap{position:relative}
+
+.auto-list{
+  /* Inputun hemen altında, kutulu dropdown */
+  position:relative;
+  top:0;
+  margin-top:4px;
+
+  background:#15120f;
+  border:1px solid var(--line);
+  border-radius:12px;
+  padding:4px 0;
+
+  box-shadow:0px 4px 12px rgba(0,0,0,0.35);
+  max-height:220px;
+  overflow-y:auto;
+
+  display:none;
+  z-index:1200;
+}
+
+.auto-item{
+  padding:10px 12px;
+  cursor:pointer;
+  font-size:14px;
+  border-bottom:1px solid rgba(255,255,255,0.08);
+}
+
+.auto-item:last-child{
+  border-bottom:none;
+}
+
+.auto-item:hover{
+  background:var(--brand);
+  color:#111;
+}
+
+.auto-item{
+  padding:10px 12px;
+  cursor:pointer;
+  font-size:14px;
+  border-bottom:1px solid rgba(255,255,255,0.08);
+}
+
+.auto-item:last-child{
+  border-bottom:none;
+}
+
+.auto-item:hover{
+  background:var(--brand);
+  color:#111;
+}
+
+.auto-item{padding:8px 10px;cursor:pointer}
+.auto-item:hover{background:var(--brand);color:#112}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+.chip{background:#172018;border:1px solid #2c4c39;color:#bdeacc;font-size:12px;border-radius:999px;padding:4px 8px}
+
+/* Advisor */
+.messages{display:flex;flex-direction:column;gap:8px;background:#221e19;border:1px solid var(--line);padding:12px;border-radius:12px;max-height:300px;overflow:auto}
+.msg{max-width:88%;padding:10px 12px;border-radius:12px;white-space:pre-wrap;line-height:1.4}
+.user{align-self:flex-end;background:#423a32}
+.bot{align-self:flex-start;background:#173224;color:#dff4e6;border:1px solid #2f5e49}
+.footergrid{display:grid;grid-template-columns:1fr 260px;gap:10px;margin-top:8px}
+textarea{min-height:90px;resize:vertical;background:#221e19;color:#fff;border:1px solid var(--line);border-radius:12px;padding:12px}
+.smallgrid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px}
+.kit{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.kit .btn{padding:10px 14px}
+.kit .warn{background:#d2a85a;color:#201a10}
+.targets{margin-top:8px;font-size:13px}
+.targets .item{display:flex;justify-content:space-between;gap:8px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:#211c17}
+.targets .item button{border:none;background:#3a332c;color:#fff;border-radius:8px;padding:4px 8px;cursor:pointer}
+.targets .empty{color:#b6ada3}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><div class="logo">🌿</div><div class="title">Smart Agriculture Assistant</div><div class="badge">beta</div></div>
+  <div class="lang">
+    <button id="langTR" class="active">Türkçe</button>
+    <button id="langEN">English</button>
+  </div>
+</header>
+
+<div class="container">
+  <!-- MAP -->
+  <div class="mapwrap">
+    <div id="map"></div>
+    <div class="stack">
+      <button class="btn green" id="btnDraw">Bölge Çiz</button>
+      <button class="btn green" id="btnTarget">Hedef Modu</button>
+      <button class="btn dark"  id="btnPan">Pan Modu</button>
+      <button class="btn dark"  id="btnReset">Görünümü Sıfırla</button>
+      <button class="btn dark"  id="btnDelLast" disabled>Son Hedefi Sil</button>
+      <button class="btn red"   id="btnClear" disabled>Hepsini Temizle</button>
+      <button class="btn red"   id="btnResetRegion" disabled>Bölgeyi Sıfırla</button>
+    </div>
+    <div class="hud" id="hud">Seçili koordinat: —</div>
+  </div>
+
+  <!-- ADDRESS QUERY -->
+  <div class="section">
+    <h3 id="geoTitle">📍 Geospatial Query</h3>
+    <div class="grid">
+      <div class="auto-wrap">
+        <label id="lblCountry">Country</label>
+        <input id="country" type="text" placeholder="e.g., Turkey">
+        <div id="list-country" class="auto-list"></div>
+      </div>
+      <div class="auto-wrap">
+        <label id="lblCity">City / Region</label>
+        <input id="city" type="text" placeholder="e.g., Ankara" disabled>
+        <div id="list-city" class="auto-list"></div>
+      </div>
+      <div class="auto-wrap">
+        <label id="lblCounty">County / District</label>
+        <input id="county" type="text" placeholder="e.g., Çankaya" disabled>
+        <div id="list-county" class="auto-list"></div>
+      </div>
+      <div class="auto-wrap">
+        <label id="lblNeighbourhood">Neighbourhood / Suburb</label>
+        <input id="neigh" type="text" placeholder="e.g., Bahçelievler" disabled>
+        <div id="list-neigh" class="auto-list"></div>
+      </div>
+      <div class="auto-wrap">
+        <label id="lblStreet">Full Address (street/number)</label>
+        <input id="street" type="text" placeholder="e.g., 48. Cadde 3/5" disabled>
+        <div id="list-street" class="auto-list"></div>
+      </div>
+
+      <div>
+        <button id="btnQuery" class="btn green" style="width:100%">Query & Show on Map</button>
+        <button id="btnAddTarget" class="btn dark" style="width:100%;margin-top:8px" disabled>Add This Address as Target</button>
+        <div class="chips">
+          <span class="chip" id="chipLoc">Location: —</span>
+          <span class="chip" id="chipPoly">Region: none</span>
+          <span class="chip" id="chipTgt">Targets: 0</span>
+        </div>
+        <div style="font-size:12px;color:#bfb7ac;margin-top:6px" id="hint">Global coverage. Type at least 1 letter.</div>
+      </div>
+    </div>
+
+    <div class="targets" id="targetsBox">
+      <div class="empty" id="targetsEmpty">No targets yet. Search an address → “Add This Address as Target”, or use Target Mode on the map.</div>
+    </div>
+  </div>
+
+  <!-- ADVISOR -->
+  <div class="section">
+    <h3 id="advTitle">💬 Smart Agriculture Advisor</h3>
+    <div class="messages" id="msgs"></div>
+    <div class="footergrid">
+      <textarea id="userTxt" placeholder="e.g., What grows best here? irrigation/pH advice..."></textarea>
+      <div>
+        <div class="smallgrid">
+          <input id="ph"    type="text" placeholder="pH (e.g., 6.7)">
+          <input id="moist" type="text" placeholder="Moisture % (e.g., 42)">
+          <input id="temp"  type="text" placeholder="Temperature °C (e.g., 22)">
+          <input id="ndvi"  type="text" placeholder="NDVI (e.g., 0.55)">
+        </div>
+        <div class="kit">
+          <button id="btnDictate" class="btn dark">🎙️ Dictate</button>
+          <button id="btnSend"   class="btn green">Send</button>
+          <button id="btnSpeak"  class="btn warn">🔊 Speak</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ===== i18n ===== */
+const i18n = {
+ tr:{draw:"Bölge Çiz",target:"Hedef Modu",pan:"Pan Modu",reset:"Görünümü Sıfırla",delLast:"Son Hedefi Sil",
+     clear:"Hepsini Temizle",resetRegion:"Bölgeyi Sıfırla",
+     geo:"📍 Coğrafi Sorgu", country:"Ülke", city:"Şehir / Bölge", county:"İlçe", neigh:"Mahalle / Semt", street:"Açık Adres (sokak/kapı no)",
+     query:"Sorgula & Haritada Göster", addTarget:"Bu Adresi Hedefe Ekle",
+     hint:"Tüm dünya desteklenir. En az 1 harf yazın.", loc:"Konum: ", region:"Bölge: ", none:"yok", targets:"Hedef: ",
+     advisor:"💬 Akıllı Tarım Danışmanı", placeholder:"Örn: Bu alanda ne yetişir? sulama/pH/NDVI tavsiyesi...",
+     dictate:"🎙️ Dikte", send:"Gönder", speak:"🔊 Oku",
+     noTgt:"Henüz hedef yok. Adres sorgula → “Bu Adresi Hedefe Ekle” veya Harita’da Hedef Modu ile tıklayın.",
+     confirmUpd:"Hedef noktalar mevcut. Güncellensin mi?",
+     selCoord:"Seçili koordinat: "}
+ ,en:{draw:"Draw Region",target:"Target Mode",pan:"Pan Mode",reset:"Reset View",delLast:"Delete Last Target",
+     clear:"Clear All",resetRegion:"Reset Region",
+     geo:"📍 Geospatial Query", country:"Country", city:"City / Region", county:"County / District", neigh:"Neighbourhood / Suburb", street:"Full Address (street/number)",
+     query:"Query & Show on Map", addTarget:"Add This Address as Target",
+     hint:"Global coverage. Type at least 1 letter.", loc:"Location: ", region:"Region: ", none:"none", targets:"Targets: ",
+     advisor:"💬 Smart Agriculture Advisor", placeholder:"e.g., What grows best here? irrigation/pH/NDVI advice...",
+     dictate:"🎙️ Dictate", send:"Send", speak:"🔊 Speak",
+     noTgt:"No targets yet. Search an address → “Add This Address as Target”, or use Target Mode on the map.",
+     confirmUpd:"Targets already exist. Do you want to update?",
+     selCoord:"Selected coordinate: "}
+};
+let lang = localStorage.getItem("lang") || "tr";
+const $ = (s)=>document.querySelector(s);
+function T(k){ return i18n[lang][k]; }
+function applyLang(){
+  $("#btnDraw").textContent=T("draw"); $("#btnTarget").textContent=T("target"); $("#btnPan").textContent=T("pan");
+  $("#btnReset").textContent=T("reset"); $("#btnDelLast").textContent=T("delLast"); $("#btnClear").textContent=T("clear");
+  $("#btnResetRegion").textContent=T("resetRegion");
+  $("#geoTitle").textContent=T("geo"); $("#lblCountry").textContent=T("country"); $("#lblCity").textContent=T("city");
+  $("#lblCounty").textContent=T("county"); $("#lblNeighbourhood").textContent=T("neigh"); $("#lblStreet").textContent=T("street");
+  $("#btnQuery").textContent=T("query"); $("#btnAddTarget").textContent=T("addTarget"); $("#hint").textContent=T("hint");
+  $("#chipLoc").textContent=T("loc")+(window._loc||"—");
+  $("#chipPoly").textContent=T("region")+(window._hasPoly?(lang==='tr'?'var':'set'):T("none"));
+  $("#chipTgt").textContent=T("targets")+(window._tgt||0);
+  $("#advTitle").textContent=T("advisor"); $("#userTxt").placeholder=T("placeholder");
+  $("#btnDictate").textContent=T("dictate"); $("#btnSend").textContent=T("send"); $("#btnSpeak").textContent=T("speak");
+  const te = document.getElementById("targetsEmpty");
+  if(te) te.textContent=T("noTgt");
+  $("#hud").textContent = T("selCoord") + (window._lastCoord || "—");
+  document.querySelectorAll(".lang button").forEach(b=>b.classList.toggle("active", b.id==="lang"+lang.toUpperCase()));
+  setButtonMode("btnPan");
+}
+$("#langTR").onclick=()=>{lang="tr";localStorage.setItem("lang","tr");applyLang();}
+$("#langEN").onclick=()=>{lang="en";localStorage.setItem("lang","en");applyLang();}
+
+/* ===== Map ===== */
+let map=L.map('map',{
+  zoomControl:false,
+  center:[39,35],
+  zoom:6,
+  tap:true,
+  touchZoom:true,
+  dragging:true
+}); 
+L.control.zoom({position:'bottomleft'}).addTo(map);
+
+// 🌍 Uydu
+var vivid = L.tileLayer(
+  'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  { maxZoom:20, attribution:'Esri, Maxar, Earthstar, CNES/Airbus, USGS' }
+).addTo(map);
+
+// 🛣 Yol + POI + Yer isimleri
+var overlayLabelRoads = L.tileLayer(
+  'https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}',
+  { maxZoom:20, opacity:1 }
+).addTo(map);
+
+var overlayPOI = L.tileLayer(
+  'https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Places/MapServer/tile/{z}/{y}/{x}',
+  { maxZoom:20, opacity:1 }
+).addTo(map);
+
+var overlayPlaces = L.tileLayer(
+  'https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+  { maxZoom:20, opacity:1 }
+).addTo(map);
+
+let fg=L.featureGroup().addTo(map);
+let drawn=null, targetMode=false, markers=[];
+setTimeout(()=>map.invalidateSize(),300);
+
+map.on("mousemove",e=>{
+  window._lastCoord=`${e.latlng.lat.toFixed(5)}, ${e.latlng.lng.toFixed(5)}`;
+  $("#hud").textContent=T("selCoord")+window._lastCoord;
+});
+map.on("click",e=>{
+  if(!targetMode) return;
+  const m=L.marker(e.latlng).addTo(fg);
+  markers.push(m);
+  enableTargetBtns();
+  fetch('/targets/add',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({lat:e.latlng.lat,lng:e.latlng.lng,label:"(map)"})})
+    .then(()=>refreshState());
+});
+function enableTargetBtns(){
+  $("#btnDelLast").disabled=markers.length===0; $("#btnClear").disabled=markers.length===0;
+}
+function drawPoly(){
+  const drawer=new L.Draw.Polygon(map,{shapeOptions:{color:'#7cc98a',weight:3,fillOpacity:.15},allowIntersection:false,showArea:true});
+  drawer.enable();
+  map.once(L.Draw.Event.CREATED, e=>{
+    if(drawn) fg.removeLayer(drawn); drawn=e.layer; fg.addLayer(drawn);
+    const pts=drawn.getLatLngs()[0].map(p=>[p.lat,p.lng]);
+    fetch('/polygon/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({"points":pts})});
+    map.fitBounds(drawn.getBounds(),{padding:[20,20]});
+    $("#btnResetRegion").disabled=false;
+    window._hasPoly=true; applyLang();
+  });
+}
+
+function setButtonMode(activeId){
+  ["btnDraw","btnTarget","btnPan"].forEach(id=>{
+    const el = $("#"+id);
+    if(!el) return;
+    if(id===activeId) el.classList.add("mode-active");
+    else el.classList.remove("mode-active");
+  });
+}
+
+$("#btnDraw").onclick=()=>{
+  targetMode=false;
+  map.getContainer().style.cursor="";
+  setButtonMode("btnDraw");
+  drawPoly();
+};
+
+$("#btnTarget").onclick=()=>{
+  targetMode=true;
+  map.getContainer().style.cursor="crosshair";
+  setButtonMode("btnTarget");
+};
+
+$("#btnPan").onclick=()=>{
+  targetMode=false;
+  map.getContainer().style.cursor="";
+  setButtonMode("btnPan");
+};
+
+$("#btnReset").onclick=()=>{ if(drawn) map.fitBounds(drawn.getBounds(),{padding:[20,20]}); else map.setView([39,35],6); };
+$("#btnDelLast").onclick=async()=>{
+  if(!markers.length) return;
+  fg.removeLayer(markers.pop()); await fetch('/targets/del_last',{method:'POST'}); enableTargetBtns(); refreshState();
+};
+$("#btnClear").onclick=async()=>{
+  markers.forEach(m=>fg.removeLayer(m)); markers=[]; await fetch('/targets/clear',{method:'POST'}); enableTargetBtns(); refreshState();
+};
+$("#btnResetRegion").onclick=async()=>{
+  if(drawn){fg.removeLayer(drawn); drawn=null;}
+  markers.forEach(m=>fg.removeLayer(m)); markers=[];
+  await fetch('/reset',{method:'POST'}); enableTargetBtns(); window._hasPoly=false; applyLang(); map.setView([39,35],6);
+};
+
+async function refreshState(){
+  const s=await (await fetch('/state')).json();
+  window._loc=s.location_label||"—"; window._hasPoly=(s.polygon||[]).length>=3; window._tgt=(s.targets||[]).length;
+  $("#chipLoc").textContent=T("loc")+window._loc;
+  $("#chipPoly").textContent=T("region")+(window._hasPoly?(lang==='tr'?'var':'set'):T("none"));
+  $("#chipTgt").textContent=T("targets")+window._tgt;
+  renderTargets(s.targets||[]);
+}
+refreshState();
+
+/* ===== Autocomplete & Address search ===== */
+async function suggest(level, q, ctx={}){
+  const u=new URLSearchParams({level,q,...ctx}); const r=await fetch('/suggest?'+u.toString()); return await r.json();
+}
+function attachAuto(inp, list, level, deps){
+  let t=null;
+  inp.addEventListener('input', ()=>{
+    const v=inp.value.trim();
+    const min = (level==='country'?1:2);
+    if(v.length<min){list.style.display="none";return;}
+    clearTimeout(t);
+    t=setTimeout(async()=>{
+      const ctx={}; deps.forEach(k=>ctx[k]=$('#'+k).value);
+      const data=await suggest(level,v,ctx);
+      list.innerHTML=""; data.forEach(it=>{
+        const d=document.createElement('div'); d.className='auto-item'; d.textContent=it.name;
+        d.onclick=()=>{ inp.value=it.name; list.style.display='none';
+          if(level==='country'){$('#city').disabled=false; $('#county').disabled=false; $('#neigh').disabled=false; $('#street').disabled=false;}
+          if(level==='city'){$('#county').disabled=false; $('#neigh').disabled=false; $('#street').disabled=false;}
+          if(level==='county'){$('#neigh').disabled=false; $('#street').disabled=false;}
+        };
+        list.appendChild(d);
+      }); list.style.display="block";
+    },120);
+  });
+  document.addEventListener('click',e=>{ if(!list.contains(e.target)&&e.target!==inp) list.style.display='none'; });
+}
+attachAuto($("#country"), $("#list-country"), "country", []);
+attachAuto($("#city"), $("#list-city"), "city", ["country"]);
+attachAuto($("#county"), $("#list-county"), "county", ["country","city"]);
+attachAuto($("#neigh"), $("#list-neigh"), "neigh", ["country","city","county"]);
+attachAuto($("#street"), $("#list-street"), "street", ["country","city","county","neigh"]);
+
+$("#btnQuery").onclick = async ()=>{
+  const q = [$("#street").value,$("#neigh").value,$("#county").value,$("#city").value,$("#country").value]
+              .filter(Boolean).join(", ");
+  if(!q) return;
+  const r = await (await fetch('/geo?q='+encodeURIComponent(q))).json();
+  if(r.lat){
+    L.marker([r.lat,r.lon]).addTo(fg).bindPopup(q).openPopup();
+    map.setView([r.lat,r.lon], 16);
+    window._lastGeocode = {lat:r.lat, lon:r.lon, label:q};
+    $("#btnAddTarget").disabled=false;
+    await fetch('/label',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({"label":q})});
+    refreshState();
+  }
+};
+$("#btnAddTarget").onclick = async ()=>{
+  const g = window._lastGeocode; if(!g) return;
+  await fetch('/targets/add',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({lat:g.lat,lng:g.lon,label:g.label})});
+  markers.push(L.marker([g.lat,g.lon]).addTo(fg));
+  enableTargetBtns(); refreshState();
+};
+
+/* Targets list UI */
+function renderTargets(arr){
+  const box=$("#targetsBox"); box.innerHTML="";
+  if(!arr.length){ const d=document.createElement('div'); d.className='empty'; d.id='targetsEmpty'; d.textContent=T("noTgt"); box.appendChild(d); return; }
+  arr.forEach((t,idx)=>{
+    const row=document.createElement('div'); row.className='item';
+    const left=document.createElement('div'); left.textContent=`${idx+1}) ${t.label||'(target)'} — ${t.lat.toFixed(5)}, ${t.lng.toFixed(5)}`;
+    const rt=document.createElement('div');
+    const btnGo=document.createElement('button'); btnGo.textContent='↦'; btnGo.title='Zoom';
+    btnGo.onclick=()=>{ map.setView([t.lat,t.lng],17); };
+    const btnX=document.createElement('button'); btnX.textContent='✕'; btnX.title='Delete';
+    btnX.onclick=async()=>{ await fetch('/targets/del_index',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({"index":idx})}); refreshState(); };
+    rt.appendChild(btnGo); rt.appendChild(btnX);
+    row.appendChild(left); row.appendChild(rt); box.appendChild(row);
+  });
+}
+
+/* ===== Chat ===== */
+function push(role, text){
+  const d=document.createElement('div'); d.className='msg '+(role==='user'?'user':'bot'); d.textContent=text;
+  $("#msgs").appendChild(d); $("#msgs").scrollTop=$("#msgs").scrollHeight; return d;
+}
+function sendChat(){
+  const txt=$("#userTxt").value.trim(); if(!txt) return;
+  push('user',txt); $("#userTxt").value="";
+  const payload={
+    message:txt,
+    sensors:{
+      ph:$("#ph").value,
+      moisture:$("#moist").value,
+      temperature:$("#temp").value,
+      ndvi:$("#ndvi").value
+    },
+    lang
+  };
+  fetch('/advice',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+    .then(r=>r.json())
+    .then(d=>{
+      window._lastBot=push('bot', d.response || (lang==='tr'?'Yanıt alınamadı.':'No response.'));
+    })
+    .catch(err=>{
+      console.error(err);
+      window._lastBot=push('bot', lang==='tr'?'Sunucu hatası.':'Server error.');
+    });
+}
+$("#btnSend").onclick=sendChat;
+$("#userTxt").addEventListener('keydown',e=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendChat(); }});
+$("#btnDictate").onclick=()=>{
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition; if(!SR){alert('SpeechRecognition not supported');return;}
+  const r=new SR(); r.lang=(lang==='tr'?'tr-TR':'en-US'); r.onresult=(e)=>{ $("#userTxt").value=( $("#userTxt").value?$("#userTxt").value+" ":"")+e.results[0][0].transcript; }; r.start();
+};
+/* TTS */
+function speak(txt){ if(!('speechSynthesis' in window)) return; speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(txt); u.lang=(lang==='tr'?'tr-TR':'en-US'); u.rate=0.95; speechSynthesis.speak(u); }
+$("#btnSpeak").onclick=()=>{ const last=window._lastBot?.textContent; if(last) speak(last); };
+
+applyLang();
+</script>
+</body>
+</html>
+{% endraw %}
+"""
+
+
+# =======================
+#  FLASK ROUTES
+# =======================
+
+@app.route("/")
+def index():
+    return render_template_string(HTML, app_name=APP_NAME)
+
+
+@app.route("/state")
+def get_state():
+    return jsonify(
+        {
+            "polygon": STATE["polygon"],
+            "targets": STATE["targets"],
+            "location_label": STATE["location_label"],
+            "sensor_matrix": STATE["sensor_matrix"],
+            "sensor_types": STATE["sensor_types"],
+        }
+    )
+
+
+@app.route("/label", methods=["POST"])
+def set_label():
+    data = request.get_json(silent=True) or {}
+    STATE["location_label"] = (data.get("label") or "").strip()
+    return jsonify({"ok": True})
+
+
+@app.route("/polygon/save", methods=["POST"])
+def polygon_save():
+    data = request.get_json(silent=True) or {}
+    pts = data.get("points") or []
+    if len(pts) < 3:
+        return jsonify({"ok": False, "error": "invalid"})
+    STATE["polygon"] = [[float(a), float(b)] for a, b in pts]
+    return jsonify({"ok": True})
+
+
+@app.route("/targets/add", methods=["POST"])
+def targets_add():
+    data = request.get_json(silent=True) or {}
+    lat, lng = data.get("lat"), data.get("lng")
+    if lat is None or lng is None:
+        return jsonify({"ok": False})
+    STATE["targets"].append(
+        {"lat": float(lat), "lng": float(lng), "label": (data.get("label") or "").strip()}
+    )
+    return jsonify({"ok": True, "count": len(STATE["targets"])})
+
+
+@app.route("/targets/del_last", methods=["POST"])
+def targets_del_last():
+    if STATE["targets"]:
+        STATE["targets"].pop()
+    return jsonify({"ok": True, "count": len(STATE["targets"])})
+
+
+@app.route("/targets/del_index", methods=["POST"])
+def targets_del_index():
+    data = request.get_json(silent=True) or {}
+    idx = int(data.get("index", -1))
+    if 0 <= idx < len(STATE["targets"]):
+        STATE["targets"].pop(idx)
+    return jsonify({"ok": True, "count": len(STATE["targets"])})
+
+
+@app.route("/targets/clear", methods=["POST"])
+def targets_clear():
+    STATE["targets"] = []
+    return jsonify({"ok": True})
+
+
+@app.route("/reset", methods=["POST"])
+def reset_all():
+    STATE["polygon"] = []
+    STATE["targets"] = []
+    STATE["location_label"] = ""
+    STATE["sensor_matrix"] = None
+    return jsonify({"ok": True})
+
+
+# ---- SENSOR MATRIX SAVE (LLM önerisini kaydetmek için istersen kullanırsın) ----
+@app.route("/sensor_matrix", methods=["POST"])
+def sensor_matrix():
+    """
+    Beklenen JSON örneği:
+      {
+        "matrix": [[1,0,1],[0,1,1]],
+        "sensor_types": ["pH","Moisture","EC","SoilTemp","NDVI","NPK"],
+        "targets": ["T1","T2"]
+      }
+    Şimdilik sadece STATE'e kaydediyoruz.
+    """
+    data = request.get_json(silent=True) or {}
+    STATE["sensor_matrix"] = data
+    return jsonify({"ok": True})
+
+
+# ---- Autocomplete: country, city, county, neighbourhood, street/address ----
+@app.route("/suggest")
+def suggest_route():
+    q = (request.args.get("q") or "").strip()
+    level = (request.args.get("level") or "country").lower()
+    country = (request.args.get("country") or "").strip()
+    city = (request.args.get("city") or "").strip()
+    county = (request.args.get("county") or "").strip()
+    neigh = (request.args.get("neigh") or "").strip()
+
+    if len(q) < 1 and level == "country":
+        pass
+    elif len(q) < 2 and level != "country":
+        return jsonify([])
+
+    if level == "country":
+        return jsonify(
+            [{"name": c} for c in COUNTRIES if q.lower() in c.lower()][:40]
+        )
+
+    parts = [q]
+    if level in ("city", "county", "neigh", "street"):
+        if county:
+            parts.append(county)
+        if city:
+            parts.append(city)
+        if country:
+            parts.append(country)
+    if level == "street" and neigh:
+        parts.insert(1, neigh)
+
+    query = ", ".join([p for p in parts if p])
+    data = nominatim_get(
+        "/search", {"q": query, "limit": 15, "addressdetails": 1}
+    )
+    seen, out = set(), []
+    for r in data:
+        name = (r.get("display_name", "").split(",")[0]).strip()
+        if name and name.lower().startswith(q.lower()) and name not in seen:
+            out.append({"name": name})
+            seen.add(name)
+    return jsonify(out[:20])
+
+
+# ---- Geocode ----
+@app.route("/geo")
+def geo():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({})
+    data = nominatim_get("/search", {"q": q, "limit": 1})
+    if not data:
+        return jsonify({})
+    it = data[0]
+    return jsonify({"lat": float(it["lat"]), "lon": float(it["lon"])})
+
+
+# ---- Advisor ----
+@app.route("/advice", methods=["POST"])
+def advice():
+    print("📩 /advice isteği geldi", flush=True)
+    d = request.get_json(silent=True) or {}
+    lang = (d.get("lang") or "tr").lower()
+    msg = (d.get("message") or "").strip()
+    sensors = d.get("sensors") or {}
+
+    # Önce OpenAI / ChatGPT dene
+    llm_out = llm_answer(msg, lang, STATE, sensors)
+    if llm_out:
+        return jsonify({"response": llm_out})
+
+    # Olmazsa fallback
+    return jsonify({
+        "response": "AI yanıt veremedi. API anahtarı veya bağlantı kontrol edilmeli."
+    }), 500
+
+
+
+
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False
+
+    )
