@@ -164,6 +164,7 @@ The model is solved using IBM CPLEX.
 ## Authors
 
 Gamze Kılıç
+
 Miray Şahin
 
 Senior Design Project
