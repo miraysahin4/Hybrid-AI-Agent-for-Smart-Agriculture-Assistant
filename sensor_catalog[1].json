@@ -1,0 +1,52 @@
+{
+  "pH": {
+    "cost": 1430,
+    "volume": 1,
+    "source": "Derived from RS485 4-in-1 soil sensor: moisture, temperature, pH, EC"
+  },
+  "Moisture": {
+    "cost": 1430,
+    "volume": 1,
+    "source": "Derived from RS485 4-in-1 soil sensor: moisture, temperature, pH, EC"
+  },
+  "EC": {
+    "cost": 1430,
+    "volume": 1,
+    "source": "Derived from RS485 4-in-1 soil sensor: moisture, temperature, pH, EC"
+  },
+  "SoilTemp": {
+    "cost": 1430,
+    "volume": 1,
+    "source": "Derived from RS485 4-in-1 soil sensor: moisture, temperature, pH, EC"
+  },
+  "NDVI": {
+    "cost": 2500,
+    "volume": 2,
+    "source": "Estimated low-cost optical/vegetation monitoring module"
+  },
+  "NPK": {
+    "cost": 5149,
+    "volume": 2,
+    "source": "RS485 soil NPK sensor"
+  },
+  "AirTemp": {
+    "cost": 600,
+    "volume": 1,
+    "source": "Estimated low-cost air temperature module"
+  },
+  "Humidity": {
+    "cost": 650,
+    "volume": 1,
+    "source": "Estimated low-cost humidity module"
+  },
+  "Light": {
+    "cost": 800,
+    "volume": 1,
+    "source": "Estimated low-cost light sensor module"
+  },
+  "Rainfall": {
+    "cost": 1800,
+    "volume": 2,
+    "source": "Estimated tipping bucket rain gauge module"
+  }
+}
