@@ -102,6 +102,8 @@ STATE = {
     "sensor_types": SENSOR_TYPES,
     "advisor_step": None,
     "recommended_sensors": None,
+    "pending_optimization": False,
+    "selected_sensors": None,
 
     # Chat step sistemi
     "chat_step": 0,
@@ -1669,11 +1671,27 @@ attachAuto($("#neigh"), $("#list-neigh"), "neigh", ["country","city","county"]);
 attachAuto($("#street"), $("#list-street"), "street", ["country","city","county","neigh"]);
 
 $("#btnQuery").onclick = async ()=>{
-  const q = [$("#street").value,$("#neigh").value,$("#county").value,$("#city").value,$("#country").value]
-              .filter(Boolean).join(", ");
-  if(!q) return;
+  const q = [
+    $("#street").value.trim(),
+    $("#neigh").value.trim(),
+    $("#county").value.trim(),
+    $("#city").value.trim(),
+    $("#country").value.trim()
+  ].filter(Boolean).join(", ");
+
+  if(!q){
+    alert(lang === "tr" ? "Lütfen konum yazın." : "Please enter a location.");
+    return;
+  }
+
   const r = await (await fetch('/geo?q='+encodeURIComponent(q))).json();
-  if(r.lat){
+    
+    if(!r.lat){
+    alert(lang === "tr" ? "Konum bulunamadı. Örn: Istanbul, Turkey yazın." : "Location not found. Try: Istanbul, Turkey");
+    return;
+  }
+  
+    if(r.lat){
     updateSideGuide(2);
     map.setView([r.lat,r.lon], 16);
     window._lastGeocode = {lat:r.lat, lon:r.lon, label:q};
@@ -1955,6 +1973,8 @@ def reset_all():
     STATE["sensor_matrix"] = None
     STATE["advisor_step"] = None        # BUG FIX: önceden return'dan sonraydı (dead code)
     STATE["recommended_sensors"] = None # BUG FIX: aynı şekilde ulaşılamıyordu
+    STATE["pending_optimization"] = False
+    STATE["selected_sensors"] = None
     STATE["chat_step"] = 0
     STATE["last_question"] = ""
     STATE["last_answer"] = ""
@@ -2042,37 +2062,37 @@ SENSOR_TECH_INFO = {
     "pH": {
         "interval": "Every 6 hours",
         "critical": "Critical if pH < 5.5 or pH > 7.5",
-        "range": "80 m",
+        "range": "45 m",
         "cost": "1430 TL"
     },
     "Moisture": {
         "interval": "Every 15–30 minutes",
         "critical": "Critical if moisture < 30% or moisture > 70%",
-        "range": "80 m",
+        "range": "45 m",
         "cost": "1430 TL"
     },
     "SoilTemp": {
         "interval": "Every 30 minutes",
         "critical": "Critical if soil temperature < 10°C or > 35°C",
-        "range": "80 m",
+        "range": "45 m",
         "cost": "1430 TL"
     },
     "NDVI": {
         "interval": "Daily or every 2–3 days",
         "critical": "Critical if NDVI < 0.30",
-        "range": "80 m",
+        "range": "45 m",
         "cost": "2500 TL"
     },
     "EC": {
         "interval": "Every 6 hours",
         "critical": "Critical if EC is too high, indicating salinity/fertilizer stress",
-        "range": "80 m",
+        "range": "45 m",
         "cost": "1430 TL"
     },
     "NPK": {
         "interval": "Daily",
         "critical": "Critical if nitrogen, phosphorus or potassium is below crop requirement",
-        "range": "80 m",
+        "range": "45 m",
         "cost": "5149 TL"
     }
 }
@@ -2089,7 +2109,7 @@ def haversine_distance_m(lat1, lng1, lat2, lng2):
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def build_coverage_matrix_note(selected_sensors, sensing_range_m=80):
+def build_coverage_matrix_note(selected_sensors, sensing_range_m=180):
     targets = STATE.get("targets", [])
 
     if not targets:
@@ -2166,6 +2186,33 @@ def extract_recommended_sensors(text):
 
     return found
 
+def format_optimization_result_for_chat(result):
+        if not result or result.get("status") != "Optimal":
+            return "Optimization could not find a feasible solution."
+
+        lines = []
+        lines.append("Optimization completed.")
+        lines.append("")
+        
+        lines.append("Recommended sensor box placement:")
+
+        for item in result.get("box_plan", []):
+            sensors = ", ".join(item.get("sensors", []))
+            lines.append(
+                f"- {item['box']} at {item['location']}: {sensors}"
+            )
+
+        lines.append("")
+        lines.append(f"Number of sensor boxes: {result.get('box_count')}")
+        lines.append(f"Sensor Cost: {result.get('sensor_cost')} TL")
+        lines.append(f"Box Cost: {result.get('box_cost')} TL")
+        lines.append(f"Gateway Cost: {result.get('gateway_cost')} TL")
+        lines.append(f"Installation Cost: {result.get('installation_cost')} TL")
+        lines.append("")
+        lines.append(f"Total Cost: {result.get('minimum_cost')} TL")
+
+        return "\n".join(lines)
+
 @app.route("/advice", methods=["POST"])
 def advice():
     d = request.get_json(silent=True) or {}
@@ -2176,7 +2223,32 @@ def advice():
     sensors = d.get("sensors") or {}
 
     if not msg:
-        return jsonify({"response": "Lütfen bir soru yazın."})
+            return jsonify({"response": "Lütfen bir soru yazın."})
+
+    confirmation_words = [
+            "yes", "okay", "ok", "confirm", "run", "start",
+            "evet", "tamam", "onaylıyorum", "başlat", "çalıştır"
+        ]
+
+    if STATE.get("pending_optimization") and msg_lower in confirmation_words:
+        selected_sensors = STATE.get("selected_sensors") or STATE.get("recommended_sensors")
+
+        result = solve_sensor_placement(
+            targets=STATE.get("targets", []),
+            recommended_sensors=selected_sensors,
+            sensing_range_m=45,
+            box_capacity=2,
+            volume_capacity=8
+        )
+
+        STATE["pending_optimization"] = False
+
+        out = (
+            "I am starting the optimization using the selected sensors.\n\n"
+            + format_optimization_result_for_chat(result)
+        )
+
+        return jsonify({"response": out})
 
     # Her yeni kullanıcı sorusunda step otomatik artsın
     STATE["chat_step"] = STATE.get("chat_step", 0) + 1
@@ -2202,15 +2274,24 @@ def advice():
     ]
 
     sensor_selection_keywords = [
+    "i choose",
+    "i selected",
+    "i select",
     "i would like to use",
     "i want to use",
+    "i will use",
     "selected sensors",
     "use ph",
     "use pH",
     "şu sensörleri",
     "bu sensörleri",
+    "sensörleri seçiyorum",
+    "sensörleri seçtim",
     "sensörleri seçmek",
-    "kullanmak istiyorum"
+    "kullanmak istiyorum",
+    "kullanacağım",
+    "seçiyorum",
+    "seçtim"
 ]
 
     if any(k.lower() in msg_lower for k in sensor_selection_keywords):
@@ -2335,14 +2416,16 @@ Cevap kuralları:
         print("✅ User selected sensors:", selected_sensors, flush=True)
 
         technical_note = build_sensor_technical_note(selected_sensors)
-        coverage_note = build_coverage_matrix_note(selected_sensors, sensing_range_m=80)
+        coverage_note = build_coverage_matrix_note(selected_sensors, sensing_range_m=45)
+
+        STATE["pending_optimization"] = True
+        STATE["selected_sensors"] = selected_sensors
 
         out = (
             out
             + "\n\n---\n"
             + technical_note
-            + "\n\n---\n"
-            + coverage_note
+            + "\n\nI can now run the optimization model with these selected sensors. Should I start the optimization?"
         )
 
     return jsonify({"response": out})
@@ -2359,16 +2442,16 @@ def optimize_sensor_placement():
     result = solve_sensor_placement(
         targets=targets,
         recommended_sensors=recommended_sensors,
-        sensing_range_m=80,
-        box_capacity=6,
-        volume_capacity=12
+        sensing_range_m=45,
+        box_capacity=3,
+        volume_capacity=8
 
     )
 
     if result:
         result["used_sensors"] = recommended_sensors
         result["target_count"] = len(targets)
-        result["sensing_range_m"] = 80
+        result["sensing_range_m"] = 45
         result["price_note"] = "Costs are calculated using sensor_catalog.json unit prices."
 
     return jsonify(result)
